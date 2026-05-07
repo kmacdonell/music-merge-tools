@@ -20,7 +20,7 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3NoHeaderError
 from mutagen.easyid3 import EasyID3
 
-DEST = Path('/Users/kevin/Music2')
+DEST = Path('/Users/kevin/Music')
 AUDIO_EXT = frozenset({'.mp3', '.m4a', '.m4p'})
 MAX_TRACK_NUM = 25  # numbers above this in filenames are likely part of the title
 DRY_RUN = '--apply' not in sys.argv
@@ -28,6 +28,13 @@ DRY_RUN = '--apply' not in sys.argv
 
 def is_audio(p):
     return p.suffix.lower() in AUDIO_EXT
+
+def normalize_album_name(name):
+    """Normalize album titles for conservative duplicate-review grouping."""
+    s = name.lower().strip()
+    s = re.sub(r'[/\\:*?"<>|_\'\.,()\[\]]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 
 def parse_album_dir_name(dirname):
@@ -137,6 +144,39 @@ def write_tags(f, fmt, changes):
                 f.tags[key] = [str(value)]
 
 
+def find_album_review_groups(dest_dir):
+    """
+    Find per-artist groups of album folders that normalize to the same album title
+    after stripping a leading year prefix.
+
+    These are review candidates only; they may be legitimate re-releases.
+    """
+    groups = []
+    for artist_dir in sorted(dest_dir.iterdir()):
+        if not artist_dir.is_dir():
+            continue
+
+        grouped = {}
+        for item in sorted(artist_dir.iterdir()):
+            if not item.is_dir():
+                continue
+            year, album_name = parse_album_dir_name(item.name)
+            album_key = normalize_album_name(album_name)
+            grouped.setdefault(album_key, []).append({
+                'dirname': item.name,
+                'year': year,
+            })
+
+        for entries in grouped.values():
+            if len(entries) > 1:
+                groups.append({
+                    'artist': artist_dir.name,
+                    'entries': entries,
+                })
+
+    return groups
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -146,6 +186,19 @@ def main():
     total_files = 0
     files_changed = 0
     total_additions = 0
+    review_groups = find_album_review_groups(DEST)
+
+    print('[0/3] Album review candidates (same title after stripping year) ...')
+    if review_groups:
+        print(f'  {len(review_groups)} groups found')
+        for group in review_groups:
+            print(f'  {group["artist"]}')
+            for entry in group['entries']:
+                year = entry['year'] if entry['year'] else 'no-year'
+                print(f'    - {entry["dirname"]}  [year={year}]')
+        print('  NOTE: these are report-only and may be legitimate re-releases.\n')
+    else:
+        print('  none found\n')
 
     for artist_dir in sorted(DEST.iterdir()):
         if not artist_dir.is_dir():
@@ -234,6 +287,7 @@ def main():
     print(f'  Files scanned:         {total_files}')
     print(f'  Files needing tags:    {files_changed}')
     print(f'  Total tag additions:   {total_additions}')
+    print(f'  Review groups:         {len(review_groups)}')
     if DRY_RUN:
         print('  (DRY RUN — no changes written. Use --apply to write.)')
     else:

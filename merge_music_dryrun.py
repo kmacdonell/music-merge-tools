@@ -24,8 +24,8 @@ AUDIO_EXT = frozenset({
     '.mp3', '.m4a', '.m4p', '.flac', '.aac', '.wav', '.aiff', '.aif', '.ogg', '.wma',
 })
 
-DEST = Path('/Users/kevin/Music2')
-SOURCES = [Path('/Users/kevin/Music'), Path('/Users/kevin/Music_backup')]
+DEST = Path('/Users/kevin/Music')
+SOURCES = [Path('/Volumes/usbshare1/Music')]
 
 # iTunes/macOS hierarchy dirs that are NOT artist names
 STRUCTURAL_DIRS = frozenset({
@@ -83,6 +83,11 @@ def strip_track_number(filename):
 
 def is_audio(path):
     return Path(path).suffix.lower() in AUDIO_EXT
+
+
+def is_drm(path):
+    """Return True if the file is DRM-protected (Apple .m4p)."""
+    return Path(path).suffix.lower() == '.m4p'
 
 
 def get_metadata(filepath):
@@ -302,6 +307,36 @@ def check_duplicate(src_meta, dest_path):
         return None
 
 
+def should_replace(src_meta, dest_path, src_path):
+    """
+    Decide whether the source should replace the dest track.
+    Rule 1: non-DRM always replaces DRM.
+    Rule 2: higher bitrate replaces lower bitrate.
+    Returns (replace: bool, reason: str).
+    """
+    src_is_drm = is_drm(src_path)
+    dst_is_drm = is_drm(dest_path)
+
+    if dst_is_drm and not src_is_drm:
+        return True, 'non-DRM replaces DRM'
+    if src_is_drm and not dst_is_drm:
+        return False, 'dest is non-DRM, source is DRM'
+
+    # Same DRM status — compare bitrates
+    dst_meta = cached_metadata(dest_path)
+    src_br = src_meta.get('bitrate')
+    dst_br = dst_meta.get('bitrate')
+    if src_br and dst_br:
+        try:
+            src_br_i = int(src_br)
+            dst_br_i = int(dst_br)
+            if src_br_i > dst_br_i + 1000:  # meaningfully higher (> 1 kbps)
+                return True, f'higher bitrate ({src_br_i // 1000}kbps > {dst_br_i // 1000}kbps)'
+        except ValueError:
+            pass
+    return False, 'no improvement'
+
+
 # ---------------------------------------------------------------------------
 # Propose dest path for new content
 # ---------------------------------------------------------------------------
@@ -358,6 +393,7 @@ def main():
     # --- Classify each source track ---
     duplicates = []
     collisions = []   # name match, different audio
+    upgrades  = []   # source is non-DRM, dest is DRM — prefer non-DRM
     would_copy = []
     unmatched = []
 
@@ -377,18 +413,32 @@ def main():
                 album_tracks = map1[norm_artist][norm_album]
                 if norm_title in album_tracks:
                     entry = album_tracks[norm_title]
-                    dup = check_duplicate(meta, entry[3])
+                    replace, reason = should_replace(meta, entry[3], trk['path'])
                     rec = {
                         'source': str(trk['path']),
                         'dest': str(entry[3]),
                         'artist': artist, 'album': album, 'title': title,
                         'via': 'map1 (artist+album+title)',
                     }
-                    if dup is False:
-                        collisions.append(rec)
+                    if replace:
+                        src_ext = trk['path'].suffix.lower()
+                        dst_ext = entry[3].suffix.lower()
+                        upgrade_dest = entry[3] if src_ext == dst_ext \
+                            else entry[3].parent / (entry[3].stem + src_ext)
+                        upgrades.append({
+                            'source': str(trk['path']),
+                            'dest': str(upgrade_dest),
+                            'old_file': str(entry[3]),
+                            'artist': artist, 'album': album, 'title': title,
+                            'via': rec['via'], 'reason': reason,
+                        })
                     else:
-                        rec['conclusive'] = dup is True
-                        duplicates.append(rec)
+                        dup = check_duplicate(meta, entry[3])
+                        if dup is False:
+                            collisions.append(rec)
+                        else:
+                            rec['conclusive'] = dup is True
+                            duplicates.append(rec)
                     matched = True
                 else:
                     # existing album, new track
@@ -414,18 +464,32 @@ def main():
             entries = map2[norm_album]
             for (nt, da, dad, df, dp) in entries:
                 if nt == norm_title:
-                    dup = check_duplicate(meta, dp)
+                    replace, reason = should_replace(meta, dp, trk['path'])
                     rec = {
                         'source': str(trk['path']),
                         'dest': str(dp),
                         'artist': artist, 'album': album, 'title': title,
                         'via': f'map2 (album+title, dest_artist={da})',
                     }
-                    if dup is False:
-                        collisions.append(rec)
+                    if replace:
+                        src_ext = trk['path'].suffix.lower()
+                        dst_ext = dp.suffix.lower()
+                        upgrade_dest = dp if src_ext == dst_ext \
+                            else dp.parent / (dp.stem + src_ext)
+                        upgrades.append({
+                            'source': str(trk['path']),
+                            'dest': str(upgrade_dest),
+                            'old_file': str(dp),
+                            'artist': artist, 'album': album, 'title': title,
+                            'via': rec['via'], 'reason': reason,
+                        })
                     else:
-                        rec['conclusive'] = dup is True
-                        duplicates.append(rec)
+                        dup = check_duplicate(meta, dp)
+                        if dup is False:
+                            collisions.append(rec)
+                        else:
+                            rec['conclusive'] = dup is True
+                            duplicates.append(rec)
                     matched = True
                     break
             if not matched:
@@ -465,6 +529,15 @@ def main():
         print(f'    matches: {d["dest"]}')
         print(f'    via: {d["via"]}')
 
+    print(f'\n--- REPLACEMENTS (non-DRM or higher bitrate): {len(upgrades)} ---')
+    for u in upgrades:
+        print(f'  REPLACE: {u["source"]}')
+        print(f'    meta: artist={u["artist"]}  album={u["album"]}  title={u["title"]}')
+        print(f'    reason: {u["reason"]}')
+        print(f'    replaces: {u["old_file"]}')
+        print(f'    -> {u["dest"]}')
+        print(f'    via: {u["via"]}')
+
     print(f'\n--- NAME COLLISIONS (same name, different audio): {len(collisions)} ---')
     for c in collisions:
         print(f'  COLLISION: {c["source"]}')
@@ -490,15 +563,20 @@ def main():
     copy_errors = []
     if apply:
         print(f'\n--- COPYING FILES ---')
-        all_copies = [(c['source'], c['dest']) for c in would_copy] + \
-                     [(u['source'], u['proposed_dest']) for u in unmatched]
-        for src, dst in all_copies:
+        all_copies = [(c['source'], c['dest'], None) for c in would_copy] + \
+                     [(u['source'], u['proposed_dest'], None) for u in unmatched] + \
+                     [(g['source'], g['dest'], g['old_file']) for g in upgrades]
+        for src, dst, old_file in all_copies:
             try:
                 dst_path = Path(dst)
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
                 copied += 1
                 print(f'  OK: {dst_path.relative_to(DEST)}')
+                # Delete old file only if it differs from dest (different extension = different path)
+                if old_file and old_file != dst:
+                    Path(old_file).unlink()
+                    print(f'  DEL: {Path(old_file).relative_to(DEST)}')
             except Exception as e:
                 copy_errors.append((src, dst, str(e)))
                 print(f'  FAIL: {dst} — {e}')
@@ -506,6 +584,7 @@ def main():
     print(f'\n{"=" * 70}')
     print('SUMMARY')
     print(f'  {len(duplicates):>5}  duplicates (skipped)')
+    print(f'  {len(upgrades):>5}  replacements (non-DRM or higher bitrate)')
     print(f'  {len(collisions):>5}  name collisions (skipped)')
     print(f'  {len(would_copy):>5}  would copy (to existing albums)')
     print(f'  {len(unmatched):>5}  unmatched (new content)')

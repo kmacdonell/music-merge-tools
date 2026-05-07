@@ -62,6 +62,11 @@ Fills in missing metadata tags on `~/Music2` files based on their directory/file
 - disc number → from disc-track filename patterns (e.g. `2-01`)
 - date → year from album directory name
 
+It also reports **album review candidates** where the same artist has multiple
+album folders that collapse to the same title after stripping a leading year
+prefix. These are **report-only** because they may be legitimate re-releases or
+different editions.
+
 **Usage:**
 
 ```
